@@ -2,6 +2,7 @@
 pragma solidity ^0.8.23;
 
 import {LibBit} from "solady/utils/LibBit.sol";
+import {LibRLP} from "solady/utils/LibRLP.sol";
 import {LibBitmap} from "solady/utils/LibBitmap.sol";
 import {LibBytes} from "solady/utils/LibBytes.sol";
 import {EfficientHashLib} from "solady/utils/EfficientHashLib.sol";
@@ -12,8 +13,13 @@ import {P256} from "solady/utils/P256.sol";
 import {WebAuthn} from "solady/utils/WebAuthn.sol";
 import {LibStorage} from "solady/utils/LibStorage.sol";
 import {EnumerableSetLib} from "solady/utils/EnumerableSetLib.sol";
+import {FixedPointMathLib as Math} from "solady/utils/FixedPointMathLib.sol";
+import {LibEIP7702} from "solady/accounts/LibEIP7702.sol";
+import {LibERC7579} from "solady/accounts/LibERC7579.sol";
 import {GuardedExecutor} from "./GuardedExecutor.sol";
 import {TokenTransferLib} from "./TokenTransferLib.sol";
+import {LibPREP} from "./LibPREP.sol";
+import {LibNonce} from "./LibNonce.sol";
 
 /// @title Delegation
 /// @notice A delegation contract for EOAs with EIP7702.
@@ -23,6 +29,7 @@ contract Delegation is EIP712, GuardedExecutor {
     using LibBytes for LibBytes.BytesStorage;
     using LibBitmap for LibBitmap.Bitmap;
     using LibStorage for LibStorage.Bump;
+    using LibRLP for LibRLP.List;
 
     ////////////////////////////////////////////////////////////////////////
     // Data Structures
@@ -64,10 +71,15 @@ contract Delegation is EIP712, GuardedExecutor {
     struct DelegationStorage {
         /// @dev The label.
         LibBytes.BytesStorage label;
-        /// @dev Bitmap of invalidated nonces. Set bit means invalidated.
-        LibBitmap.Bitmap invalidatedNonces;
-        /// @dev The current nonce salt.
-        uint256 nonceSalt;
+        /// @dev The `r` value for the secp256k1 curve to show that this contract is a PREP.
+        bytes32 rPREP;
+        /// @dev Mapping for 4337-style 2D nonce sequences.
+        /// Each nonce has the following bit layout:
+        /// - Upper 192 bits are used for the `seqKey` (sequence key).
+        ///   The upper 16 bits of the `seqKey` is `MULTICHAIN_NONCE_PREFIX`,
+        ///   then the UserOp EIP-712 hash will exclude the chain ID.
+        /// - Lower 64 bits are used for the sequential nonce corresponding to the `seqKey`.
+        mapping(uint192 => LibStorage.Ref) nonceSeqs;
         /// @dev Set of key hashes for onchain enumeration of authorized keys.
         EnumerableSetLib.Bytes32Set keyHashes;
         /// @dev Mapping of key hash to the key in encoded form.
@@ -120,11 +132,14 @@ contract Delegation is EIP712, GuardedExecutor {
     /// @dev The key does not exist.
     error KeyDoesNotExist();
 
-    /// @dev The nonce is invalid.
-    error InvalidNonce();
-
     /// @dev The `opData` is too short.
     error OpDataTooShort();
+
+    /// @dev The PREP `initData` is invalid.
+    error InvalidPREP();
+
+    /// @dev The `keyType` cannot be super admin.
+    error KeyTypeCannotBeSuperAdmin();
 
     ////////////////////////////////////////////////////////////////////////
     // Events
@@ -147,39 +162,55 @@ contract Delegation is EIP712, GuardedExecutor {
     /// @dev The key with a corresponding `keyHash` has been revoked.
     event Revoked(bytes32 indexed keyHash);
 
-    /// @dev The `nonce` have been invalidated.
-    event NonceInvalidated(uint256 nonce);
-
-    /// @dev The nonce salt has been incremented to `newNonceSalt`.
-    event NonceSaltIncremented(uint256 newNonceSalt);
-
     /// @dev The `checker` has been authorized to use `isValidSignature` for `keyHash`.
     event SignatureCheckerApprovalSet(
         bytes32 indexed keyHash, address indexed checker, bool isApproved
     );
 
+    /// @dev The nonce sequence of is invalidated up to (inclusive) of `nonce`.
+    /// The new available nonce will be `nonce + 1`.
+    /// This event is emitted in the `invalidateNonce` function,
+    /// as well as the `execute` function when an execution is performed directly
+    /// on the Delegation with a `keyHash`, bypassing the EntryPoint.
+    event NonceInvalidated(uint256 nonce);
+
+    ////////////////////////////////////////////////////////////////////////
+    // Immutables
+    ////////////////////////////////////////////////////////////////////////
+
+    /// @dev The entry point address.
+    address public immutable ENTRY_POINT;
+
     ////////////////////////////////////////////////////////////////////////
     // Constants
     ////////////////////////////////////////////////////////////////////////
 
-    /// @dev The entry point address.
-    address public constant ENTRY_POINT = 0x307AF7d28AfEE82092aA95D35644898311CA5360;
-
     /// @dev For EIP712 signature digest calculation for the `execute` function.
     bytes32 public constant EXECUTE_TYPEHASH = keccak256(
-        "Execute(bool multichain,Call[] calls,uint256 nonce,uint256 nonceSalt)Call(address target,uint256 value,bytes data)"
+        "Execute(bool multichain,Call[] calls,uint256 nonce)Call(address to,uint256 value,bytes data)"
     );
 
     /// @dev For EIP712 signature digest calculation for the `execute` function.
-    bytes32 public constant CALL_TYPEHASH =
-        keccak256("Call(address target,uint256 value,bytes data)");
+    bytes32 public constant CALL_TYPEHASH = keccak256("Call(address to,uint256 value,bytes data)");
 
     /// @dev For EIP712 signature digest calculation.
     bytes32 public constant DOMAIN_TYPEHASH = _DOMAIN_TYPEHASH;
 
+    /// @dev Nonce prefix to signal that the payload is to be signed with EIP-712 without the chain ID.
+    /// This constant is a pun for "chain ID 0".
+    uint16 public constant MULTICHAIN_NONCE_PREFIX = 0xc1d0;
+
     /// @dev General capacity for enumerable sets,
     /// to prevent off-chain full enumeration from running out-of-gas.
     uint256 internal constant _CAP = 512;
+
+    ////////////////////////////////////////////////////////////////////////
+    // Constructor
+    ////////////////////////////////////////////////////////////////////////
+
+    constructor(address entryPoint) payable {
+        ENTRY_POINT = entryPoint;
+    }
 
     ////////////////////////////////////////////////////////////////////////
     // ERC1271
@@ -196,7 +227,7 @@ contract Delegation is EIP712, GuardedExecutor {
         virtual
         returns (bytes4)
     {
-        (bool isValid, bytes32 keyHash) = _unwrapAndValidateSignature(digest, signature);
+        (bool isValid, bytes32 keyHash) = unwrapAndValidateSignature(digest, signature);
         if (LibBit.and(keyHash != 0, isValid)) {
             isValid = getKey(keyHash).isSuperAdmin
                 || _getKeyExtraStorage(keyHash).checkers.contains(msg.sender);
@@ -268,41 +299,35 @@ contract Delegation is EIP712, GuardedExecutor {
         emit SignatureCheckerApprovalSet(keyHash, checker, isApproved);
     }
 
-    /// @dev Invalidates the nonce.
+    /// @dev Increments the sequence for the `seqKey` in nonce (i.e. upper 192 bits).
+    /// This invalidates the nonces for the `seqKey`, up to (inclusive) `uint64(nonce)`.
     function invalidateNonce(uint256 nonce) public virtual onlyThis {
-        _invalidateNonce(nonce);
+        LibNonce.invalidate(_getDelegationStorage().nonceSeqs, nonce);
+        emit NonceInvalidated(nonce);
     }
 
-    /// @dev Increments the nonce salt by a pseudorandom uint32 value.
-    function incrementNonceSalt() public virtual onlyThis returns (uint256 newNonceSalt) {
-        DelegationStorage storage $ = _getDelegationStorage();
-        newNonceSalt = $.nonceSalt;
-        unchecked {
-            newNonceSalt += uint32(
-                uint256(EfficientHashLib.hash(newNonceSalt, block.timestamp, uint160(msg.sender)))
-            );
-        }
-        $.nonceSalt = newNonceSalt;
-        emit NonceSaltIncremented(newNonceSalt);
+    /// @dev Upgrades the proxy delegation.
+    /// If this delegation is delegated directly without usage of EIP7702Proxy,
+    /// this operation will not affect the logic until the authority is redelegated
+    /// to a proper EIP7702Proxy. The `newImplementation` should implement
+    /// `upgradeProxyDelegation` or similar, otherwise upgrades will be locked and
+    /// only a new EIP-7702 transaction can change the authority's logic.
+    function upgradeProxyDelegation(address newImplementation) public virtual onlyThis {
+        LibEIP7702.upgradeProxyDelegation(newImplementation);
     }
 
     ////////////////////////////////////////////////////////////////////////
     // Public View Functions
     ////////////////////////////////////////////////////////////////////////
 
+    /// @dev Return current nonce with sequence key.
+    function getNonce(uint192 seqKey) public view virtual returns (uint256) {
+        return LibNonce.get(_getDelegationStorage().nonceSeqs, seqKey);
+    }
+
     /// @dev Returns the label.
     function label() public view virtual returns (string memory) {
         return string(_getDelegationStorage().label.get());
-    }
-
-    /// @dev Returns true if the nonce is invalidated.
-    function nonceIsInvalidated(uint256 nonce) public view virtual returns (bool) {
-        return _getDelegationStorage().invalidatedNonces.get(nonce);
-    }
-
-    /// @dev Returns the nonce salt.
-    function nonceSalt() public view virtual returns (uint256) {
-        return _getDelegationStorage().nonceSalt;
     }
 
     /// @dev Returns the number of authorized keys.
@@ -318,7 +343,7 @@ contract Delegation is EIP712, GuardedExecutor {
     /// @dev Returns the key corresponding to the `keyHash`. Reverts if the key does not exist.
     function getKey(bytes32 keyHash) public view virtual returns (Key memory key) {
         bytes memory data = _getDelegationStorage().keyStorage[keyHash].get();
-        if (data.length == 0) revert KeyDoesNotExist();
+        if (data.length == uint256(0)) revert KeyDoesNotExist();
         unchecked {
             uint256 n = data.length - 7; // 5 + 1 + 1 bytes of fixed length fields.
             uint256 packed = uint56(bytes7(LibBytes.load(data, n)));
@@ -326,6 +351,41 @@ contract Delegation is EIP712, GuardedExecutor {
             key.keyType = KeyType(uint8(packed >> 8)); // 1 byte.
             key.isSuperAdmin = uint8(packed) != 0; // 1 byte.
             key.publicKey = LibBytes.truncate(data, n);
+        }
+    }
+
+    /// @dev Returns arrays of all (non-expired) authorized keys and their hashes.
+    function getKeys()
+        public
+        view
+        virtual
+        returns (Key[] memory keys, bytes32[] memory keyHashes)
+    {
+        uint256 totalCount = keyCount();
+
+        keys = new Key[](totalCount);
+        keyHashes = new bytes32[](totalCount);
+
+        uint256 validCount = 0;
+        for (uint256 i = 0; i < totalCount; i++) {
+            bytes32 keyHash = _getDelegationStorage().keyHashes.at(i);
+            Key memory key = getKey(keyHash);
+
+            // If key.expiry is set and the key is expired, skip it.
+            if (LibBit.and(key.expiry != 0, block.timestamp > key.expiry)) {
+                continue;
+            }
+
+            keys[validCount] = key;
+            keyHashes[validCount] = keyHash;
+
+            validCount++;
+        }
+
+        // Adjust the length of the arrays to the validCount
+        assembly {
+            mstore(keys, validCount)
+            mstore(keyHashes, validCount)
         }
     }
 
@@ -360,8 +420,9 @@ contract Delegation is EIP712, GuardedExecutor {
         return _getKeyExtraStorage(keyHash).checkers.values();
     }
 
-    /// @dev Computes the EIP712 digest for `calls`, with `nonceSalt` from storage.
-    /// If the nonce is odd, the digest will be computed without the chain ID and with a zero nonce salt.
+    /// @dev Computes the EIP712 digest for `calls`.
+    /// If the the nonce starts with `MULTICHAIN_NONCE_PREFIX`,
+    /// the digest will be computed without the chain ID.
     /// Otherwise, the digest will be computed with the chain ID.
     function computeDigest(Call[] calldata calls, uint256 nonce)
         public
@@ -382,34 +443,32 @@ contract Delegation is EIP712, GuardedExecutor {
                 )
             );
         }
+        bool isMultichain = nonce >> 240 == MULTICHAIN_NONCE_PREFIX;
         bytes32 structHash = EfficientHashLib.hash(
-            uint256(EXECUTE_TYPEHASH),
-            nonce & 1,
-            uint256(a.hash()),
-            nonce,
-            nonce & 1 > 0 ? 0 : _getDelegationStorage().nonceSalt
+            uint256(EXECUTE_TYPEHASH), LibBit.toUint(isMultichain), uint256(a.hash()), nonce
         );
-        return nonce & 1 > 0 ? _hashTypedDataSansChainId(structHash) : _hashTypedData(structHash);
+        return isMultichain ? _hashTypedDataSansChainId(structHash) : _hashTypedData(structHash);
+    }
+
+    /// @dev Returns the `r` value for initializing the PREP.
+    function rPREP() public view virtual returns (bytes32) {
+        return _getDelegationStorage().rPREP;
+    }
+
+    /// @dev Returns if the compact PREP signature is valid.
+    function isPREP() public view virtual returns (bool) {
+        return LibPREP.isPREP(address(this), _getDelegationStorage().rPREP);
     }
 
     ////////////////////////////////////////////////////////////////////////
     // Internal Helpers
     ////////////////////////////////////////////////////////////////////////
 
-    /// @dev Invalidates the nonce.
-    function _invalidateNonce(uint256 nonce) internal virtual {
-        _getDelegationStorage().invalidatedNonces.set(nonce);
-        emit NonceInvalidated(nonce);
-    }
-
-    /// @dev Invalidates the nonce. Reverts if the nonce is already invalidated.
-    function _useNonce(uint256 nonce) internal virtual {
-        if (nonceIsInvalidated(nonce)) revert InvalidNonce();
-        _invalidateNonce(nonce);
-    }
-
     /// @dev Adds the key. If the key already exist, its expiry will be updated.
     function _addKey(Key memory key) internal virtual returns (bytes32 keyHash) {
+        if (key.isSuperAdmin) {
+            if (!_keyTypeCanBeSuperAdmin(key.keyType)) revert KeyTypeCannotBeSuperAdmin();
+        }
         // `keccak256(abi.encode(key.keyType, keccak256(key.publicKey)))`.
         keyHash = hash(key);
         DelegationStorage storage $ = _getDelegationStorage();
@@ -417,6 +476,11 @@ contract Delegation is EIP712, GuardedExecutor {
             abi.encodePacked(key.publicKey, key.expiry, key.keyType, key.isSuperAdmin)
         );
         $.keyHashes.add(keyHash);
+    }
+
+    /// @dev Returns if the `keyType` can be a super admin.
+    function _keyTypeCanBeSuperAdmin(KeyType keyType) internal view virtual returns (bool) {
+        return keyType != KeyType.P256;
     }
 
     /// @dev Removes the key corresponding to the `keyHash`. Reverts if the key does not exist.
@@ -431,14 +495,26 @@ contract Delegation is EIP712, GuardedExecutor {
     // Entry Point Functions
     ////////////////////////////////////////////////////////////////////////
 
-    /// @dev Pays `paymentAmount` of `paymentToken` to the Entry Point.
-    function payEntryPoint(address paymentToken, uint256 paymentAmount, address eoa)
-        public
-        virtual
-    {
-        if (msg.sender != ENTRY_POINT) revert Unauthorized();
-        if (eoa != address(this)) revert Unauthorized();
-        TokenTransferLib.safeTransfer(paymentToken, msg.sender, paymentAmount);
+    /// @dev Pays `paymentAmount` of `paymentToken` to the `paymentRecipient`.
+    function compensate(
+        address paymentToken,
+        address paymentRecipient,
+        uint256 paymentAmount,
+        address eoa,
+        bytes32 keyHash,
+        bytes32 userOpDigest,
+        bytes calldata paymentSignature
+    ) public virtual {
+        if (!LibBit.and(msg.sender == ENTRY_POINT, eoa == address(this))) revert Unauthorized();
+        TokenTransferLib.safeTransfer(paymentToken, paymentRecipient, paymentAmount);
+        // Increase spend.
+        if (!(keyHash == bytes32(0) || _isSuperAdmin(keyHash))) {
+            SpendStorage storage spends = _getGuardedExecutorKeyStorage(keyHash).spends;
+            _incrementSpent(spends.spends[paymentToken], paymentToken, paymentAmount);
+        }
+        // Silence unused variables warning.
+        userOpDigest = userOpDigest;
+        paymentSignature = paymentSignature;
     }
 
     /// @dev Returns if the signature is valid, along with its `keyHash`.
@@ -446,18 +522,6 @@ contract Delegation is EIP712, GuardedExecutor {
     /// `abi.encodePacked(bytes(innerSignature), bytes32(keyHash), bool(prehash))`.
     function unwrapAndValidateSignature(bytes32 digest, bytes calldata signature)
         public
-        view
-        virtual
-        returns (bool isValid, bytes32 keyHash)
-    {
-        return _unwrapAndValidateSignature(digest, signature);
-    }
-
-    /// @dev Returns if the signature is valid, along with its `keyHash`.
-    /// The `signature` is a wrapped signature, given by
-    /// `abi.encodePacked(bytes(innerSignature), bytes32(keyHash), bool(prehash))`.
-    function _unwrapAndValidateSignature(bytes32 digest, bytes calldata signature)
-        internal
         view
         virtual
         returns (bool isValid, bytes32 keyHash)
@@ -505,6 +569,54 @@ contract Delegation is EIP712, GuardedExecutor {
                 abi.decode(key.publicKey, (address)), digest, signature
             );
         }
+    }
+
+    /// @dev Initializes the PREP.
+    /// If already initialized, early returns true.
+    /// `initData` is encoded using ERC7821 style batch execution encoding.
+    /// (ERC7821 is a variant of ERC7579).
+    /// `abi.encode(calls, abi.encodePacked(bytes32(saltAndDelegation)))`,
+    /// where `calls` is of type `Call[]`,
+    /// and `saltAndDelegation` is `bytes32((uint256(salt) << 160) | uint160(delegation))`.
+    function initializePREP(bytes calldata initData) public virtual returns (bool) {
+        // We can omit the check for `msg.sender == ENTRY_POINT`,
+        // having a correct `initData` will be sufficient.
+        DelegationStorage storage $ = _getDelegationStorage();
+        if ($.rPREP != 0) return true;
+
+        // Compute the digest of the calls in `initData`.
+        (bytes32[] calldata pointers, bytes calldata opData) =
+            LibERC7579.decodeBatchAndOpData(initData);
+        bytes32[] memory a = EfficientHashLib.malloc(pointers.length);
+        for (uint256 i; i < pointers.length; ++i) {
+            (address target, uint256 value, bytes calldata data) =
+                LibERC7579.getExecution(pointers, i);
+            a.set(
+                i,
+                EfficientHashLib.hash(
+                    CALL_TYPEHASH,
+                    bytes32(uint256(uint160(target))),
+                    bytes32(value),
+                    EfficientHashLib.hashCalldata(data)
+                )
+            );
+        }
+        // Arguments are `(address target, bytes32 digest, bytes32 saltAndDelegation)`.
+        bytes32 r = LibPREP.rPREP(address(this), a.hash(), LibBytes.loadCalldata(opData, 0x00));
+        // If `r == 0`, it means that `address(this)` is not a valid PREP address.
+        // Also, add in a bounds check just to be extra safe.
+        if (LibBit.or(opData.length < 0x20, r == 0)) revert InvalidPREP();
+        $.rPREP = r;
+
+        // Use assembly to reinterpret cast into `Call[]`.
+        Call[] calldata calls;
+        assembly ("memory-safe") {
+            calls.length := pointers.length
+            calls.offset := pointers.offset
+        }
+        _execute(calls, bytes32(0));
+
+        return true;
     }
 
     ////////////////////////////////////////////////////////////////////////
@@ -563,9 +675,8 @@ contract Delegation is EIP712, GuardedExecutor {
     {
         // Entry point workflow.
         if (msg.sender == ENTRY_POINT) {
-            if (opData.length < 0x40) revert OpDataTooShort();
-            _useNonce(uint256(LibBytes.loadCalldata(opData, 0x00)));
-            return _execute(calls, LibBytes.loadCalldata(opData, 0x20));
+            if (opData.length < 0x20) revert OpDataTooShort();
+            return _execute(calls, LibBytes.loadCalldata(opData, 0x00));
         }
 
         // Simple workflow without `opData`.
@@ -577,7 +688,9 @@ contract Delegation is EIP712, GuardedExecutor {
         // Simple workflow with `opData`.
         if (opData.length < 0x20) revert OpDataTooShort();
         uint256 nonce = uint256(LibBytes.loadCalldata(opData, 0x00));
-        _useNonce(nonce);
+        LibNonce.checkAndIncrement(_getDelegationStorage().nonceSeqs, nonce);
+        emit NonceInvalidated(nonce);
+
         (bool isValid, bytes32 keyHash) = unwrapAndValidateSignature(
             computeDigest(calls, nonce), LibBytes.sliceCalldata(opData, 0x20)
         );
@@ -594,6 +707,16 @@ contract Delegation is EIP712, GuardedExecutor {
         return getKey(keyHash).isSuperAdmin;
     }
 
+    /// @dev Returns the storage seed for a `keyHash`.
+    function _getGuardedExecutorKeyStorageSeed(bytes32 keyHash)
+        internal
+        view
+        override
+        returns (bytes32)
+    {
+        return _getDelegationStorage().keyExtraStorage[keyHash].slot();
+    }
+
     ////////////////////////////////////////////////////////////////////////
     // EIP712
     ////////////////////////////////////////////////////////////////////////
@@ -607,6 +730,6 @@ contract Delegation is EIP712, GuardedExecutor {
         returns (string memory name, string memory version)
     {
         name = "Delegation";
-        version = "0.0.1";
+        version = "0.0.3";
     }
 }
