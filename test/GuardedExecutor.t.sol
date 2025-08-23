@@ -3,6 +3,8 @@ pragma solidity ^0.8.4;
 
 import "./utils/SoladyTest.sol";
 import "./Base.t.sol";
+import "./utils/mocks/MockCallChecker.sol";
+import "./utils/mocks/MockCounter.sol";
 
 contract GuardedExecutorTest is BaseTest {
     mapping(uint256 => mapping(address => uint256)) expectedSpents;
@@ -11,6 +13,124 @@ contract GuardedExecutorTest is BaseTest {
 
     function setUp() public virtual override {
         super.setUp();
+    }
+
+    function testSetAndGetCallCheckers(bytes32) public {
+        MockCounter counter = new MockCounter();
+        MockCallChecker checker = new MockCallChecker();
+
+        DelegatedEOA memory d = _randomEIP7702DelegatedEOA();
+        PassKey memory k = _randomSecp256r1PassKey();
+
+        vm.prank(d.eoa);
+        d.d.authorize(k.k);
+
+        Orchestrator.Intent memory u;
+        u.eoa = d.eoa;
+        u.combinedGas = 10000000;
+
+        ERC7821.Call[] memory calls = new ERC7821.Call[](1);
+        calls[0].to = address(counter);
+        calls[0].data = abi.encodeWithSelector(MockCounter.increment.selector);
+
+        // Try, but without any checker configured.
+        u.nonce = d.d.getNonce(0);
+        u.executionData = abi.encode(calls);
+        u.signature = _sig(k, u);
+        assertEq(
+            oc.execute(abi.encode(u)), bytes4(keccak256("UnauthorizedCall(bytes32,address,bytes)"))
+        );
+        // Set the call checker.
+        bytes32 forKeyHash = _randomChance(2) ? k.keyHash : _ANY_KEYHASH;
+        address forTarget = _randomChance(2) ? address(counter) : _ANY_TARGET;
+        vm.prank(d.eoa);
+        d.d.setCallChecker(forKeyHash, forTarget, address(checker));
+        // Check the infos.
+        GuardedExecutor.CallCheckerInfo[] memory infos = d.d.callCheckerInfos(forKeyHash);
+        assertEq(infos.length, 1);
+        assertEq(infos[0].checker, address(checker));
+        assertEq(infos[0].target, forTarget);
+
+        // Try, but with the checker not yet configured.
+        u.nonce = d.d.getNonce(0);
+        u.executionData = abi.encode(calls);
+        u.signature = _sig(k, u);
+        assertEq(
+            oc.execute(abi.encode(u)), bytes4(keccak256("UnauthorizedCall(bytes32,address,bytes)"))
+        );
+
+        // Try, now with the checker configured to authorize the call..
+        checker.setAuthorized(
+            k.keyHash, address(counter), abi.encodeWithSelector(MockCounter.increment.selector)
+        );
+        u.nonce = d.d.getNonce(0);
+        u.executionData = abi.encode(calls);
+        u.signature = _sig(k, u);
+        assertEq(oc.execute(abi.encode(u)), bytes4(0));
+        assertEq(counter.counter(), 1);
+
+        // Try, now with the checker removed.
+        vm.prank(d.eoa);
+        d.d.setCallChecker(forKeyHash, forTarget, address(0));
+        // Check the infos.
+        assertEq(d.d.callCheckerInfos(forKeyHash).length, 0);
+
+        u.nonce = d.d.getNonce(0);
+        u.executionData = abi.encode(calls);
+        u.signature = _sig(k, u);
+        assertEq(
+            oc.execute(abi.encode(u)), bytes4(keccak256("UnauthorizedCall(bytes32,address,bytes)"))
+        );
+    }
+
+    function testApproveIncreaseSpent(bytes32) public {
+        DelegatedEOA memory d = _randomEIP7702DelegatedEOA();
+        PassKey memory k = _randomSecp256r1PassKey();
+
+        paymentToken.mint(d.eoa, 1 ether);
+
+        vm.startPrank(d.eoa);
+        d.d.authorize(k.k);
+        d.d.setCanExecute(k.keyHash, address(paymentToken), _ANY_FN_SEL, true);
+        vm.stopPrank();
+
+        Orchestrator.Intent memory u;
+        u.eoa = d.eoa;
+        u.combinedGas = 10000000;
+
+        ERC7821.Call[] memory calls = new ERC7821.Call[](2);
+
+        calls[0].to = address(paymentToken);
+        calls[0].data =
+            abi.encodeWithSignature("approve(address,uint256)", address(d.eoa), 0.1 ether);
+
+        calls[1].to = address(paymentToken);
+        calls[1].data = abi.encodeWithSignature(
+            "transferFrom(address,address,uint256)", address(d.eoa), address(0xb0b), 0.1 ether
+        );
+
+        u.nonce = d.d.getNonce(0);
+        u.executionData = abi.encode(calls);
+        u.signature = _sig(k, u);
+        assertEq(oc.execute(abi.encode(u)), bytes4(keccak256("NoSpendPermissions()")));
+
+        // Check that after the spend permission has been done, the token can be approved
+        // and moved via `transferFrom`.
+
+        vm.startPrank(d.eoa);
+        d.d.setSpendLimit(
+            k.keyHash, address(paymentToken), GuardedExecutor.SpendPeriod.Day, 1 ether
+        );
+        vm.stopPrank();
+
+        u.nonce = d.d.getNonce(0);
+        u.executionData = abi.encode(calls);
+        u.signature = _sig(k, u);
+        assertEq(oc.execute(abi.encode(u)), 0);
+        assertEq(paymentToken.balanceOf(address(0xb0b)), 0.1 ether);
+
+        // Check that the spent has been increased.
+        assertEq(d.d.spendInfos(k.keyHash)[0].spent, 0.2 ether);
     }
 
     function testCanExecuteGetsResetAfterKeyIsReadded(address target, bytes4 fnSel) public {
@@ -103,13 +223,67 @@ contract GuardedExecutorTest is BaseTest {
         }
     }
 
+    function testTransferFromGuard(bytes32) public {
+        DelegatedEOA memory d = _randomEIP7702DelegatedEOA();
+        PassKey memory k = _randomSecp256r1PassKey();
+
+        paymentToken.mint(address(0xb0b), 1 ether);
+        vm.prank(address(0xb0b));
+        paymentToken.approve(d.eoa, 1 ether);
+
+        Orchestrator.Intent memory u;
+        u.eoa = d.eoa;
+        u.combinedGas = 10000000;
+
+        bool transferToSelf = _randomChance(2);
+
+        ERC7821.Call[] memory calls = new ERC7821.Call[](1);
+        calls[0].to = address(paymentToken);
+        calls[0].data = abi.encodeWithSignature(
+            "transferFrom(address,address,uint256)",
+            address(0xb0b),
+            transferToSelf ? d.eoa : address(0xdad),
+            0.1 ether
+        );
+        u.executionData = abi.encode(calls);
+
+        vm.startPrank(d.eoa);
+        d.d.authorize(k.k);
+        d.d.setCanExecute(k.keyHash, address(paymentToken), _ANY_FN_SEL, true);
+        vm.stopPrank();
+
+        u.nonce = d.d.getNonce(0);
+        u.signature = _sig(k, u);
+
+        emit LogBool("transferToSelf:", transferToSelf);
+        if (transferToSelf) {
+            assertEq(oc.execute(abi.encode(u)), 0);
+            assertEq(paymentToken.balanceOf(d.eoa), 0.1 ether);
+            return;
+        }
+
+        assertEq(oc.execute(abi.encode(u)), bytes4(keccak256("NoSpendPermissions()")));
+
+        vm.startPrank(d.eoa);
+        d.d.setSpendLimit(
+            k.keyHash, address(paymentToken), GuardedExecutor.SpendPeriod.Day, 1 ether
+        );
+        vm.stopPrank();
+
+        u.nonce = d.d.getNonce(0);
+        u.signature = _sig(k, u);
+        assertEq(oc.execute(abi.encode(u)), 0);
+        assertEq(paymentToken.balanceOf(address(0xdad)), 0.1 ether);
+        assertEq(d.d.spendInfos(k.keyHash)[0].spent, 0.1 ether);
+    }
+
     function _randomCalldata(bytes4 fnSel) internal returns (bytes memory) {
         if (fnSel == _EMPTY_CALLDATA_FN_SEL && _randomChance(8)) return "";
         return abi.encodePacked(fnSel);
     }
 
     function testOnlySuperAdminAndEOACanSelfExecute() public {
-        EntryPoint.UserOp memory u;
+        Orchestrator.Intent memory u;
         DelegatedEOA memory d = _randomEIP7702DelegatedEOA();
         u.eoa = d.eoa;
         u.combinedGas = 10000000;
@@ -130,12 +304,12 @@ contract GuardedExecutorTest is BaseTest {
 
             ERC7821.Call[] memory innerCalls = new ERC7821.Call[](1);
             innerCalls[0].to = address(0);
-            innerCalls[0].data = abi.encodeWithSelector(MockDelegation.setX.selector, x);
+            innerCalls[0].data = abi.encodeWithSelector(MockAccount.setX.selector, x);
 
             ERC7821.Call[] memory calls = new ERC7821.Call[](1);
             calls[0].to = i == 0 ? address(d.eoa) : address(0);
             calls[0].data = abi.encodeWithSelector(
-                Delegation.execute.selector, _ERC7821_BATCH_EXECUTION_MODE, abi.encode(innerCalls)
+                ERC7821.execute.selector, _ERC7821_BATCH_EXECUTION_MODE, abi.encode(innerCalls)
             );
 
             vm.expectRevert(bytes4(keccak256("Unauthorized()")));
@@ -143,46 +317,46 @@ contract GuardedExecutorTest is BaseTest {
 
             vm.prank(d.eoa);
             d.d.execute(_ERC7821_BATCH_EXECUTION_MODE, abi.encode(calls));
-            assertEq(d.d.x(), x);
+            assertEq(d.d.x(), x, "1");
 
             d.d.resetX();
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
 
-            u.nonce = ep.getNonce(u.eoa, 0);
             u.signature = _eoaSig(d.privateKey, u);
-            assertEq(ep.execute(abi.encode(u)), 0);
-            assertEq(d.d.x(), x);
+            assertEq(oc.execute(abi.encode(u)), 0, "2");
+            assertEq(d.d.x(), x, "3");
 
             d.d.resetX();
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.signature = _sig(kSuperAdmin, u);
-            assertEq(ep.execute(abi.encode(u)), 0);
-            assertEq(d.d.x(), x);
+            assertEq(oc.execute(abi.encode(u)), 0, "4");
+            assertEq(d.d.x(), x, "5");
 
             d.d.resetX();
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.signature = _sig(kRegular, u);
             assertEq(
-                ep.execute(abi.encode(u)),
-                bytes4(keccak256("UnauthorizedCall(bytes32,address,bytes)"))
+                oc.execute(abi.encode(u)),
+                bytes4(keccak256("UnauthorizedCall(bytes32,address,bytes)")),
+                "6"
             );
-            assertEq(d.d.x(), 0);
+            assertEq(d.d.x(), 0, "7");
 
             d.d.resetX();
         }
     }
 
     function testSetAndRemoveSpendLimitRevertsForSuperAdmin() public {
-        EntryPoint.UserOp memory u;
+        Orchestrator.Intent memory u;
         DelegatedEOA memory d = _randomEIP7702DelegatedEOA();
 
         u.eoa = d.eoa;
         u.combinedGas = 1000000;
-        u.nonce = ep.getNonce(u.eoa, 0);
+        u.nonce = d.d.getNonce(0);
 
         PassKey memory k = _randomSecp256k1PassKey();
         k.k.isSuperAdmin = true;
@@ -192,77 +366,85 @@ contract GuardedExecutorTest is BaseTest {
         {
             calls = new ERC7821.Call[](1);
             // Authorize the key.
-            calls[0].data = abi.encodeWithSelector(Delegation.authorize.selector, k.k);
+            calls[0].data = abi.encodeWithSelector(IthacaAccount.authorize.selector, k.k);
 
             u.executionData = abi.encode(calls);
             u.nonce = 0xc1d0 << 240;
 
             u.signature = _sig(d, u);
 
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
         }
         // Set spend limits.
         {
             calls = new ERC7821.Call[](1);
             calls[0] = _setSpendLimitCall(k, address(0), GuardedExecutor.SpendPeriod.Hour, 1 ether);
 
-            u.nonce = ep.getNonce(d.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(d, u);
 
-            assertEq(ep.execute(abi.encode(u)), bytes4(keccak256("SuperAdminCanSpendAnything()")));
+            assertEq(oc.execute(abi.encode(u)), bytes4(keccak256("SuperAdminCanSpendAnything()")));
         }
         // Remove spend limits.
         {
             calls = new ERC7821.Call[](1);
             calls[0] = _removeSpendLimitCall(k, address(0), GuardedExecutor.SpendPeriod.Hour);
 
-            u.nonce = ep.getNonce(d.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(d, u);
 
-            assertEq(ep.execute(abi.encode(u)), bytes4(keccak256("SuperAdminCanSpendAnything()")));
+            assertEq(oc.execute(abi.encode(u)), bytes4(keccak256("SuperAdminCanSpendAnything()")));
         }
     }
 
-    function testSetAndRemoveSpendLimit() public {
+    function testSetAndRemoveSpendLimit(uint256 amount) public {
         vm.warp(86400 * 100);
 
-        EntryPoint.UserOp memory u;
+        Orchestrator.Intent memory u;
         DelegatedEOA memory d = _randomEIP7702DelegatedEOA();
 
         u.eoa = d.eoa;
         u.combinedGas = 1000000;
-        u.nonce = ep.getNonce(u.eoa, 0);
+        u.nonce = d.d.getNonce(0);
 
         PassKey memory k = _randomSecp256k1PassKey();
 
         address token = LibClone.clone(address(paymentToken));
         _mint(token, u.eoa, type(uint192).max);
 
-        uint256 amount = _bound(_randomUniform(), 0, 0.1 ether);
+        amount = bound(amount, 0, 0.1 ether);
 
         GuardedExecutor.SpendInfo[] memory infos;
         ERC7821.Call[] memory calls;
+
+        GuardedExecutor.SpendPeriod[] memory periods = new GuardedExecutor.SpendPeriod[](2);
+        periods[0] = GuardedExecutor.SpendPeriod.Hour;
+        periods[1] = GuardedExecutor.SpendPeriod.Day;
+        if (_randomChance(2)) {
+            periods[0] = GuardedExecutor.SpendPeriod.Forever;
+        }
+
         // Authorize.
         {
             calls = new ERC7821.Call[](4);
             // Authorize the key.
-            calls[0].data = abi.encodeWithSelector(Delegation.authorize.selector, k.k);
+            calls[0].data = abi.encodeWithSelector(IthacaAccount.authorize.selector, k.k);
             // As it's not a superAdmin, we shall just make it able to execute anything for testing sake.
             calls[1].data = abi.encodeWithSelector(
                 GuardedExecutor.setCanExecute.selector, k.keyHash, _ANY_TARGET, _ANY_FN_SEL, true
             );
             // Set some spend limits.
-            calls[2] = _setSpendLimitCall(k, token, GuardedExecutor.SpendPeriod.Hour, 1 ether);
-            calls[3] = _setSpendLimitCall(k, token, GuardedExecutor.SpendPeriod.Day, 1 ether);
+            calls[2] = _setSpendLimitCall(k, token, periods[0], 1 ether);
+            calls[3] = _setSpendLimitCall(k, token, periods[1], 1 ether);
 
             u.executionData = abi.encode(calls);
             u.nonce = 0xc1d0 << 240;
 
             u.signature = _eoaSig(d.privateKey, u);
 
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
             assertEq(d.d.spendInfos(k.keyHash).length, 2);
         }
 
@@ -271,10 +453,10 @@ contract GuardedExecutorTest is BaseTest {
             calls = new ERC7821.Call[](1);
             calls[0] = _transferCall2(token, address(0xb0b), amount);
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(k, u);
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
 
             infos = d.d.spendInfos(k.keyHash);
             for (uint256 i; i < infos.length; ++i) {
@@ -285,37 +467,38 @@ contract GuardedExecutorTest is BaseTest {
         // Test removal reduces infos' length.
         {
             calls = new ERC7821.Call[](1);
-            calls[0] = _removeSpendLimitCall(k, token, GuardedExecutor.SpendPeriod.Hour);
+            calls[0] = _removeSpendLimitCall(k, token, periods[0]);
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(k, u);
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
 
             infos = d.d.spendInfos(k.keyHash);
             assertEq(infos.length, 1);
-            assertEq(uint8(infos[0].period), uint8(GuardedExecutor.SpendPeriod.Day));
+            assertEq(uint8(infos[0].period), uint8(periods[1]));
             assertEq(infos[0].spent, amount);
         }
 
         // Test re-addition resets the spent and last updated.
         {
             calls = new ERC7821.Call[](1);
-            calls[0] = _setSpendLimitCall(k, token, GuardedExecutor.SpendPeriod.Hour, 1 ether);
+            calls[0] = _setSpendLimitCall(k, token, periods[0], 1 ether);
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(k, u);
-            assertEq(ep.execute(abi.encode(u)), 0);
-
+            assertEq(oc.execute(abi.encode(u)), 0);
             infos = d.d.spendInfos(k.keyHash);
             for (uint256 i; i < infos.length; ++i) {
-                if (infos[i].period == GuardedExecutor.SpendPeriod.Hour) {
+                if (infos[i].period == periods[0]) {
                     assertEq(infos[i].spent, 0);
                     assertEq(infos[i].lastUpdated, 0);
                 } else {
                     assertEq(infos[i].spent, amount);
-                    assertNotEq(infos[i].lastUpdated, 0);
+                    if (amount > 0) {
+                        assertNotEq(infos[i].lastUpdated, 0);
+                    }
                 }
             }
         }
@@ -325,15 +508,14 @@ contract GuardedExecutorTest is BaseTest {
             calls = new ERC7821.Call[](1);
             calls[0] = _transferCall2(token, address(0xb0b), amount);
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(k, u);
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
 
             infos = d.d.spendInfos(k.keyHash);
-            assertEq(infos.length, 2);
             for (uint256 i; i < infos.length; ++i) {
-                if (infos[i].period == GuardedExecutor.SpendPeriod.Hour) {
+                if (infos[i].period == periods[0]) {
                     assertEq(infos[i].spent, amount);
                 } else {
                     assertEq(infos[i].spent, amount * 2);
@@ -344,13 +526,13 @@ contract GuardedExecutorTest is BaseTest {
         // Test removal.
         {
             calls = new ERC7821.Call[](2);
-            calls[0] = _removeSpendLimitCall(k, token, GuardedExecutor.SpendPeriod.Hour);
-            calls[1] = _removeSpendLimitCall(k, token, GuardedExecutor.SpendPeriod.Day);
+            calls[0] = _removeSpendLimitCall(k, token, periods[0]);
+            calls[1] = _removeSpendLimitCall(k, token, periods[1]);
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(k, u);
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
 
             assertEq(d.d.spendInfos(k.keyHash).length, 0);
         }
@@ -360,22 +542,35 @@ contract GuardedExecutorTest is BaseTest {
             calls = new ERC7821.Call[](1);
             calls[0] = _transferCall2(token, address(0xb0b), amount * 999);
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(k, u);
-            assertEq(ep.execute(abi.encode(u)), bytes4(keccak256("NoSpendPermissions()")));
+
+            // If first 4bytes are 0xdfc924d5, then it's "anotherTransfer" call, and the spend limit will not catch it.
+            if (
+                (
+                    calls[0].data[0] == bytes1(uint8(0xdf))
+                        && calls[0].data[1] == bytes1(uint8(0xc9))
+                        && calls[0].data[2] == bytes1(uint8(0x24))
+                        && calls[0].data[3] == bytes1(uint8(0xd5))
+                ) || amount == 0
+            ) {
+                assertEq(oc.execute(abi.encode(u)), 0);
+            } else {
+                assertEq(oc.execute(abi.encode(u)), bytes4(keccak256("NoSpendPermissions()")));
+            }
         }
 
         // Test re-addition resets the spent and last updated.
         {
             calls = new ERC7821.Call[](2);
-            calls[0] = _setSpendLimitCall(k, token, GuardedExecutor.SpendPeriod.Hour, 1 ether);
-            calls[1] = _setSpendLimitCall(k, token, GuardedExecutor.SpendPeriod.Day, 1 ether);
+            calls[0] = _setSpendLimitCall(k, token, periods[0], 1 ether);
+            calls[1] = _setSpendLimitCall(k, token, periods[1], 1 ether);
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(k, u);
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
 
             infos = d.d.spendInfos(k.keyHash);
             for (uint256 i; i < infos.length; ++i) {
@@ -389,10 +584,10 @@ contract GuardedExecutorTest is BaseTest {
             calls = new ERC7821.Call[](1);
             calls[0] = _transferCall2(token, address(0xb0b), amount);
 
-            u.nonce = ep.getNonce(u.eoa, 0);
+            u.nonce = d.d.getNonce(0);
             u.executionData = abi.encode(calls);
             u.signature = _sig(k, u);
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
 
             infos = d.d.spendInfos(k.keyHash);
             for (uint256 i; i < infos.length; ++i) {
@@ -402,12 +597,12 @@ contract GuardedExecutorTest is BaseTest {
     }
 
     function testSetSpendLimitWithTwoPeriods() public {
-        EntryPoint.UserOp memory u;
+        Orchestrator.Intent memory u;
         DelegatedEOA memory d = _randomEIP7702DelegatedEOA();
 
         u.eoa = d.eoa;
         u.combinedGas = 1000000;
-        u.nonce = ep.getNonce(u.eoa, 0);
+        u.nonce = d.d.getNonce(0);
 
         PassKey memory k = _randomSecp256k1PassKey();
 
@@ -421,7 +616,7 @@ contract GuardedExecutorTest is BaseTest {
         {
             calls = new ERC7821.Call[](6);
             // Authorize the key.
-            calls[0].data = abi.encodeWithSelector(Delegation.authorize.selector, k.k);
+            calls[0].data = abi.encodeWithSelector(IthacaAccount.authorize.selector, k.k);
             // As it's not a superAdmin, we shall just make it able to execute anything for testing sake.
             calls[1].data = abi.encodeWithSelector(
                 GuardedExecutor.setCanExecute.selector, k.keyHash, _ANY_TARGET, _ANY_FN_SEL, true
@@ -437,7 +632,7 @@ contract GuardedExecutorTest is BaseTest {
 
             u.signature = _eoaSig(d.privateKey, u);
 
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
             assertEq(d.d.spendInfos(k.keyHash).length, 4);
         }
 
@@ -451,7 +646,7 @@ contract GuardedExecutorTest is BaseTest {
         u.executionData = abi.encode(calls);
         u.signature = _sig(k, u);
 
-        assertEq(ep.execute(abi.encode(u)), 0);
+        assertEq(oc.execute(abi.encode(u)), 0);
         GuardedExecutor.SpendInfo[] memory infos = d.d.spendInfos(k.keyHash);
         for (uint256 i; i < infos.length; ++i) {
             if (infos[i].token == token0) assertEq(infos[i].spent, amount0);
@@ -460,12 +655,12 @@ contract GuardedExecutorTest is BaseTest {
     }
 
     function testSpends(bytes32) public {
-        EntryPoint.UserOp memory u;
+        Orchestrator.Intent memory u;
         DelegatedEOA memory d = _randomEIP7702DelegatedEOA();
 
         u.eoa = d.eoa;
         u.combinedGas = 1000000;
-        u.nonce = ep.getNonce(u.eoa, 0);
+        u.nonce = d.d.getNonce(0);
 
         PassKey memory k = _randomSecp256k1PassKey();
 
@@ -483,7 +678,7 @@ contract GuardedExecutorTest is BaseTest {
         {
             ERC7821.Call[] memory calls = new ERC7821.Call[](2 + tokens.length);
             // Authorize the key.
-            calls[0].data = abi.encodeWithSelector(Delegation.authorize.selector, k.k);
+            calls[0].data = abi.encodeWithSelector(IthacaAccount.authorize.selector, k.k);
             // As it's not a superAdmin, we shall just make it able to execute anything for testing sake.
             calls[1].data = abi.encodeWithSelector(
                 GuardedExecutor.setCanExecute.selector, k.keyHash, _ANY_TARGET, _ANY_FN_SEL, true
@@ -499,7 +694,7 @@ contract GuardedExecutorTest is BaseTest {
 
             u.signature = _eoaSig(d.privateKey, u);
 
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
             assertEq(d.d.spendInfos(k.keyHash).length, tokens.length);
         }
 
@@ -532,32 +727,36 @@ contract GuardedExecutorTest is BaseTest {
                 address token = tokens[_randomUniform() % tokens.length];
                 uint256 amount = _bound(_randomUniform(), 0, 0.000001 ether);
                 if (token != address(0) && _randomChance(4)) {
+                    uint256 approveAmount = _bound(_randomUniform(), 0, 0.000001 ether);
                     calls[i].to = token;
                     calls[i].data = abi.encodeWithSignature(
-                        "approve(address,uint256)", address(0xb0b), _random()
+                        "approve(address,uint256)", address(0xb0b), approveAmount
                     );
                     hasApproval[0][token] = true;
+                    expectedSpents[0][token] += approveAmount;
                     continue;
                 }
                 if (token != address(0) && _randomChance(4)) {
+                    uint256 permit2Amount = _bound(_randomUniform(), 0, 0.000001 ether);
                     calls[i].to = _PERMIT2;
                     calls[i].data = abi.encodeWithSignature(
                         "approve(address,address,uint160,uint48)",
                         token,
                         address(0xb0b),
-                        uint160(_random()),
+                        uint160(permit2Amount),
                         uint48(_bound(_random(), block.timestamp, type(uint48).max))
                     );
                     hasPermit2Approval[0][token] = true;
+                    expectedSpents[0][token] += permit2Amount;
                     continue;
                 }
-                calls[i] = _transferCall2(token, address(0xb0b), amount);
+                calls[i] = _transferCall(token, address(0xb0b), amount);
                 expectedSpents[0][token] += amount;
             }
             u.executionData = abi.encode(calls);
             u.signature = _sig(k, u);
 
-            assertEq(ep.execute(abi.encode(u)), 0);
+            assertEq(oc.execute(abi.encode(u)), 0);
             GuardedExecutor.SpendInfo[] memory infos = d.d.spendInfos(k.keyHash);
             for (uint256 i; i < infos.length; ++i) {
                 assertEq(infos[i].spent, expectedSpents[0][infos[i].token]);
@@ -586,35 +785,37 @@ contract GuardedExecutorTest is BaseTest {
         }
     }
 
-    function testSpendERC20WithSecp256r1ViaEntryPoint() public {
-        _testSpendWithPassKeyViaEntryPoint(
+    function testSpendERC20WithSecp256r1ViaOrchestrator() public {
+        _testSpendWithPassKeyViaOrchestrator(
             _randomSecp256r1PassKey(), LibClone.clone(address(paymentToken))
         );
     }
 
-    function testSpendERC20WithSecp256k1ViaEntryPoint() public {
-        _testSpendWithPassKeyViaEntryPoint(
+    function testSpendERC20WithSecp256k1ViaOrchestrator() public {
+        _testSpendWithPassKeyViaOrchestrator(
             _randomSecp256k1PassKey(), LibClone.clone(address(paymentToken))
         );
     }
 
-    function testSpendNativeWithSecp256r1ViaEntryPoint() public {
-        _testSpendWithPassKeyViaEntryPoint(_randomSecp256r1PassKey(), address(0));
+    function testSpendNativeWithSecp256r1ViaOrchestrator() public {
+        _testSpendWithPassKeyViaOrchestrator(_randomSecp256r1PassKey(), address(0));
     }
 
-    function testSpendNativeWithSecp256k1ViaEntryPoint() public {
-        _testSpendWithPassKeyViaEntryPoint(_randomSecp256k1PassKey(), address(0));
+    function testSpendNativeWithSecp256k1ViaOrchestrator() public {
+        _testSpendWithPassKeyViaOrchestrator(_randomSecp256k1PassKey(), address(0));
     }
 
-    function _testSpendWithPassKeyViaEntryPoint(PassKey memory k, address tokenToSpend) internal {
-        EntryPoint.UserOp memory u;
+    function _testSpendWithPassKeyViaOrchestrator(PassKey memory k, address tokenToSpend)
+        internal
+    {
+        Orchestrator.Intent memory u;
         GuardedExecutor.SpendInfo memory info;
 
         uint256 gExecute;
         DelegatedEOA memory d = _randomEIP7702DelegatedEOA();
 
         u.eoa = d.eoa;
-        u.nonce = ep.getNonce(u.eoa, 0);
+        u.nonce = d.d.getNonce(0);
         u.paymentToken = address(paymentToken);
         u.paymentAmount = 1 ether;
         u.paymentMaxAmount = type(uint192).max;
@@ -627,7 +828,7 @@ contract GuardedExecutorTest is BaseTest {
         {
             ERC7821.Call[] memory calls = new ERC7821.Call[](4);
             // Authorize the key.
-            calls[0].data = abi.encodeWithSelector(Delegation.authorize.selector, k.k);
+            calls[0].data = abi.encodeWithSelector(IthacaAccount.authorize.selector, k.k);
             // As it's not a superAdmin, we shall just make it able to execute anything for testing sake.
             calls[1].data = abi.encodeWithSelector(
                 GuardedExecutor.setCanExecute.selector, k.keyHash, _ANY_TARGET, _ANY_FN_SEL, true
@@ -645,7 +846,7 @@ contract GuardedExecutorTest is BaseTest {
             (gExecute, u.combinedGas,) = _estimateGasForEOAKey(u);
             u.signature = _eoaSig(d.privateKey, u);
 
-            assertEq(ep.execute{gas: gExecute}(abi.encode(u)), 0);
+            assertEq(oc.execute{gas: gExecute}(abi.encode(u)), 0);
             assertEq(d.d.spendInfos(k.keyHash).length, 2);
             assertEq(d.d.spendInfos(k.keyHash)[0].spent, 0);
 
@@ -653,7 +854,7 @@ contract GuardedExecutorTest is BaseTest {
             assertEq(d.d.spendInfos(k.keyHash)[1].spent, 0);
         }
 
-        // Prep UserOp, and submit it. This UserOp should pass.
+        // Prep Intent, and submit it. This Intent should pass.
         {
             u.nonce = 0;
 
@@ -664,8 +865,8 @@ contract GuardedExecutorTest is BaseTest {
             (gExecute, u.combinedGas,) = _estimateGas(k, u);
             u.signature = _sig(k, u);
 
-            // UserOp should pass.
-            assertEq(ep.execute{gas: gExecute}(abi.encode(u)), 0);
+            // Intent should pass.
+            assertEq(oc.execute{gas: gExecute}(abi.encode(u)), 0);
             assertEq(_balanceOf(tokenToSpend, address(0xb0b)), 0.6 ether);
             assertEq(d.d.spendInfos(k.keyHash)[0].spent, 0.6 ether);
 
@@ -673,16 +874,16 @@ contract GuardedExecutorTest is BaseTest {
             assertEq(d.d.spendInfos(k.keyHash)[1].spent, 1 ether);
         }
 
-        // Prep UserOp to try to exceed daily spend limit. This UserOp should fail.
+        // Prep Intent to try to exceed daily spend limit. This Intent should fail.
         {
             u.nonce++;
             u.signature = _sig(k, u);
 
-            // UserOp should fail.
-            assertEq(ep.execute(abi.encode(u)), GuardedExecutor.ExceededSpendLimit.selector);
+            // Intent should fail.
+            assertEq(oc.execute(abi.encode(u)), GuardedExecutor.ExceededSpendLimit.selector);
         }
 
-        // Prep UserOp to try to exactly hit daily spend limit. This UserOp should pass.
+        // Prep Intent to try to exactly hit daily spend limit. This Intent should pass.
         {
             u.nonce++;
 
@@ -693,7 +894,7 @@ contract GuardedExecutorTest is BaseTest {
             (gExecute, u.combinedGas,) = _estimateGas(k, u);
             u.signature = _sig(k, u);
 
-            assertEq(ep.execute{gas: gExecute}(abi.encode(u)), 0);
+            assertEq(oc.execute{gas: gExecute}(abi.encode(u)), 0);
             assertEq(_balanceOf(tokenToSpend, address(0xb0b)), 1 ether);
             assertEq(d.d.spendInfos(k.keyHash)[0].spent, 1 ether);
         }
@@ -720,8 +921,8 @@ contract GuardedExecutorTest is BaseTest {
         assertEq(uint8(info.period), uint8(GuardedExecutor.SpendPeriod.Day));
         assertEq(info.limit, 1 ether);
 
-        // Prep UserOp to try to see if we can start spending again in a new day.
-        // This UserOp should pass.
+        // Prep Intent to try to see if we can start spending again in a new day.
+        // This Intent should pass.
         {
             u.nonce++;
 
@@ -733,7 +934,7 @@ contract GuardedExecutorTest is BaseTest {
 
             u.signature = _sig(k, u);
 
-            assertEq(ep.execute{gas: gExecute}(abi.encode(u)), 0);
+            assertEq(oc.execute{gas: gExecute}(abi.encode(u)), 0);
             assertEq(_balanceOf(tokenToSpend, address(0xb0b)), 1.5 ether);
             assertEq(d.d.spendInfos(k.keyHash)[0].spent, 0.5 ether);
         }

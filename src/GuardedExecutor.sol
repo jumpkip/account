@@ -8,9 +8,11 @@ import {LibZip} from "solady/utils/LibZip.sol";
 import {LibBit} from "solady/utils/LibBit.sol";
 import {DynamicArrayLib} from "solady/utils/DynamicArrayLib.sol";
 import {EnumerableSetLib} from "solady/utils/EnumerableSetLib.sol";
+import {EnumerableMapLib} from "solady/utils/EnumerableMapLib.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
 import {FixedPointMathLib as Math} from "solady/utils/FixedPointMathLib.sol";
 import {DateTimeLib} from "solady/utils/DateTimeLib.sol";
+import {ICallChecker} from "./interfaces/ICallChecker.sol";
 
 /// @title GuardedExecutor
 /// @notice Mixin for spend limits and calldata execution guards.
@@ -24,8 +26,10 @@ import {DateTimeLib} from "solady/utils/DateTimeLib.sol";
 ///   a key cannot spend tokens (ERC20s and native) until spend permissions have been added.
 /// - When a spend permission is removed and re-added, its spent amount will be reset.
 abstract contract GuardedExecutor is ERC7821 {
+    using LibBytes for *;
     using DynamicArrayLib for *;
     using EnumerableSetLib for *;
+    using EnumerableMapLib for *;
 
     ////////////////////////////////////////////////////////////////////////
     // Enums
@@ -37,7 +41,8 @@ abstract contract GuardedExecutor is ERC7821 {
         Day,
         Week,
         Month,
-        Year
+        Year,
+        Forever
     }
 
     ////////////////////////////////////////////////////////////////////////
@@ -61,6 +66,14 @@ abstract contract GuardedExecutor is ERC7821 {
         uint256 currentSpent;
         /// @dev The start of the current period.
         uint256 current;
+    }
+
+    /// @dev Information about a call checker.
+    struct CallCheckerInfo {
+        /// @dev The target. Could be a wildcard like `ANY_TARGET`.
+        address target;
+        /// @dev The checker.
+        address checker;
     }
 
     ////////////////////////////////////////////////////////////////////////
@@ -97,6 +110,9 @@ abstract contract GuardedExecutor is ERC7821 {
 
     /// @dev Emitted when the ability to execute a call with function selector is set.
     event CanExecuteSet(bytes32 keyHash, address target, bytes4 fnSel, bool can);
+
+    /// @dev Emitted when a call checker is set for the `keyHash` and `target`.
+    event CallCheckerSet(bytes32 keyHash, address target, address checker);
 
     /// @dev Emitted when a spend limit is set.
     event SpendLimitSet(bytes32 keyHash, address token, SpendPeriod period, uint256 limit);
@@ -163,6 +179,8 @@ abstract contract GuardedExecutor is ERC7821 {
         EnumerableSetLib.Bytes32Set canExecute;
         /// @dev Mapping of `keyHash` to the `SpendStorage`.
         SpendStorage spends;
+        /// @dev Mapping of 3rd-party checkers for determining if an address can execute a function.
+        EnumerableMapLib.AddressToAddressMap callCheckers;
     }
 
     /// @dev Returns the storage pointer.
@@ -173,7 +191,7 @@ abstract contract GuardedExecutor is ERC7821 {
     {
         bytes32 seed =
             keyHash == ANY_KEYHASH ? ANY_KEYHASH : _getGuardedExecutorKeyStorageSeed(keyHash);
-        uint256 namespaceHash = uint72(bytes9(keccak256("PORTO_GUARDED_EXECUTOR_KEY_STORAGE")));
+        uint256 namespaceHash = uint72(bytes9(keccak256("ITHACA_GUARDED_EXECUTOR_KEY_STORAGE")));
         assembly ("memory-safe") {
             // Non-standard hashing scheme to reduce chance of conflict with regular Solidity.
             mstore(0x09, namespaceHash)
@@ -241,13 +259,25 @@ abstract contract GuardedExecutor is ERC7821 {
                 t.erc20s.p(target);
                 t.transferAmounts.p(LibBytes.loadCalldata(data, 0x24)); // `amount`.
             }
+            // `transferFrom(address,address,uint256)`.
+            // The account may have existing ERC20 allowances. If `transferFrom` is used
+            // to transfer to an account that is not `address(this)`, treat it as outflow.
+            if (fnSel == 0x23b872dd) {
+                // `transferFrom(address from, address to, uint256 amount)`.
+                if (LibBytes.loadCalldata(data, 0x24).lsbToAddress() == address(this)) continue;
+                if (LibBytes.loadCalldata(data, 0x44) == 0) continue; // `amount == 0`.
+                t.erc20s.p(target);
+                t.transferAmounts.p(LibBytes.loadCalldata(data, 0x44)); // `amount`.
+            }
             // `approve(address,uint256)`.
             // We have to revoke any new approvals after the batch, else a bad app can
             // leave an approval to let them drain unlimited tokens after the batch.
             if (fnSel == 0x095ea7b3) {
                 if (LibBytes.loadCalldata(data, 0x24) == 0) continue; // `amount == 0`.
                 t.approvedERC20s.p(target);
-                t.approvalSpenders.p(LibBytes.loadCalldata(data, 0x04)); // `spender`.
+                t.approvalSpenders.p(LibBytes.loadCalldata(data, 0x04).lsbToAddress()); // `spender`.
+                t.erc20s.p(target); // `token`.
+                t.transferAmounts.p(LibBytes.loadCalldata(data, 0x24)); // `amount`.
             }
             // The only Permit2 method that requires `msg.sender` to approve.
             // `approve(address,address,uint160,uint48)`.
@@ -256,15 +286,10 @@ abstract contract GuardedExecutor is ERC7821 {
             if (fnSel == 0x87517c45) {
                 if (target != _PERMIT2) continue;
                 if (LibBytes.loadCalldata(data, 0x44) == 0) continue; // `amount == 0`.
-                t.permit2ERC20s.p(LibBytes.loadCalldata(data, 0x04)); // `token`.
-                t.permit2Spenders.p(LibBytes.loadCalldata(data, 0x24)); // `spender`.
-            }
-            // `setSpendLimit(bytes32,address,uint8,uint256)`.
-            if (fnSel == 0x598daac4) {
-                if (target != address(this)) continue;
-                if (LibBytes.loadCalldata(data, 0x04) != keyHash) continue;
-                t.erc20s.p(LibBytes.loadCalldata(data, 0x24)); // `token`.
-                t.transferAmounts.p(uint256(0));
+                t.permit2ERC20s.p(LibBytes.loadCalldata(data, 0x04).lsbToAddress()); // `token`.
+                t.permit2Spenders.p(LibBytes.loadCalldata(data, 0x24).lsbToAddress()); // `spender`.
+                t.erc20s.p(LibBytes.loadCalldata(data, 0x04).lsbToAddress()); // `token`.
+                t.transferAmounts.p(LibBytes.loadCalldata(data, 0x44)); // `amount`.
             }
         }
 
@@ -284,6 +309,20 @@ abstract contract GuardedExecutor is ERC7821 {
         // Perform after the `_execute`, so that in the case where `calls`
         // contain a `setSpendLimit`, it will affect the `_incrementSpent`.
         _incrementSpent(spends.spends[address(0)], address(0), totalNativeSpend);
+
+        // Revoke all non-zero approvals that have been made.
+        // As spend permissions are whitelist style, we need to make sure that
+        // approvals are revoked. This is to prevent sidestepping the guard.
+        for (uint256 i; i < t.approvedERC20s.length(); ++i) {
+            address token = t.approvedERC20s.getAddress(i);
+            SafeTransferLib.safeApprove(token, t.approvalSpenders.getAddress(i), 0);
+        }
+
+        // Revoke all non-zero Permit2 direct approvals that have been made.
+        for (uint256 i; i < t.permit2ERC20s.length(); ++i) {
+            address token = t.permit2ERC20s.getAddress(i);
+            SafeTransferLib.permit2Lockdown(token, t.permit2Spenders.getAddress(i));
+        }
 
         // Increments the spent amounts.
         for (uint256 i; i < t.erc20s.length(); ++i) {
@@ -305,16 +344,6 @@ abstract contract GuardedExecutor is ERC7821 {
                     )
                 )
             );
-        }
-        // Revoke all non-zero approvals that have been made, if there's a spend limit.
-        for (uint256 i; i < t.approvedERC20s.length(); ++i) {
-            address token = t.approvedERC20s.getAddress(i);
-            SafeTransferLib.safeApprove(token, t.approvalSpenders.getAddress(i), 0);
-        }
-        // Revoke all non-zero Permit2 direct approvals that have been made, if there's a spend limit.
-        for (uint256 i; i < t.permit2ERC20s.length(); ++i) {
-            address token = t.permit2ERC20s.getAddress(i);
-            SafeTransferLib.permit2Lockdown(token, t.permit2Spenders.getAddress(i));
         }
     }
 
@@ -357,6 +386,33 @@ abstract contract GuardedExecutor is ERC7821 {
             _packCanExecute(target, fnSel), can, 2048
         );
         emit CanExecuteSet(keyHash, target, fnSel, can);
+    }
+
+    /// @dev Sets a third party call checker, which has a view function
+    /// `canExecute(bytes32,address,bytes)` to return if a call can be executed.
+    /// By setting `checker` to `address(0)`, it removes the it from the list of
+    /// call checkers on this account.
+    /// The `ANY_KEYHASH` and `ANY_TARGET` wildcards apply here too.
+    function setCallChecker(bytes32 keyHash, address target, address checker)
+        public
+        virtual
+        onlyThis
+        checkKeyHashIsNonZero(keyHash)
+    {
+        if (keyHash != ANY_KEYHASH) {
+            if (_isSuperAdmin(keyHash)) revert SuperAdminCanSpendAnything();
+        }
+
+        // It is ok even if we don't check for `_isSelfExecute` here, as we will still
+        // check it in `canExecute` before any custom call checker.
+
+        EnumerableMapLib.AddressToAddressMap storage checkers =
+            _getGuardedExecutorKeyStorage(keyHash).callCheckers;
+
+        // Impose a max capacity of 2048 for map enumeration, which should be more than enough.
+        checkers.update(target, checker, checker != address(0), 2048);
+
+        emit CallCheckerSet(keyHash, target, checker);
     }
 
     /// @dev Sets the spend limit of `token` for `keyHash` for `period`.
@@ -449,6 +505,11 @@ abstract contract GuardedExecutor is ERC7821 {
             if (c.contains(_packCanExecute(ANY_TARGET, fnSel))) return true;
             if (c.contains(_packCanExecute(ANY_TARGET, ANY_FN_SEL))) return true;
         }
+        // Note that these checks have to be placed after the `_isSelfExecute` check.
+        if (_checkCall(keyHash, keyHash, target, target, data)) return true;
+        if (_checkCall(keyHash, keyHash, ANY_TARGET, target, data)) return true;
+        if (_checkCall(ANY_KEYHASH, keyHash, target, target, data)) return true;
+        if (_checkCall(ANY_KEYHASH, keyHash, ANY_TARGET, target, data)) return true;
         return false;
     }
 
@@ -496,6 +557,21 @@ abstract contract GuardedExecutor is ERC7821 {
         }
     }
 
+    /// @dev Returns the list of call checker infos.
+    function callCheckerInfos(bytes32 keyHash)
+        public
+        view
+        virtual
+        returns (CallCheckerInfo[] memory results)
+    {
+        EnumerableMapLib.AddressToAddressMap storage checkers =
+            _getGuardedExecutorKeyStorage(keyHash).callCheckers;
+        results = new CallCheckerInfo[](checkers.length());
+        for (uint256 i; i < results.length; ++i) {
+            (results[i].target, results[i].checker) = checkers.at(i);
+        }
+    }
+
     /// @dev Returns spend and execute infos for each provided key hash in the same order.
     function spendAndExecuteInfos(bytes32[] calldata keyHashes)
         public
@@ -527,12 +603,27 @@ abstract contract GuardedExecutor is ERC7821 {
         // Note: DateTimeLib's months and month-days start from 1.
         if (period == SpendPeriod.Month) return DateTimeLib.dateToTimestamp(year, month, 1);
         if (period == SpendPeriod.Year) return DateTimeLib.dateToTimestamp(year, 1, 1);
+        if (period == SpendPeriod.Forever) return 1; // Non-zero to differentiate from not set.
         revert(); // We shouldn't hit here.
     }
 
     ////////////////////////////////////////////////////////////////////////
     // Internal Helpers
     ////////////////////////////////////////////////////////////////////////
+
+    /// @dev Returns if the call can be executed via consulting a 3rd party checker.
+    function _checkCall(
+        bytes32 forKeyHash,
+        bytes32 keyHash,
+        address forTarget,
+        address target,
+        bytes calldata data
+    ) internal view returns (bool) {
+        (bool exists, address checker) =
+            _getGuardedExecutorKeyStorage(forKeyHash).callCheckers.tryGet(forTarget);
+        if (exists) return ICallChecker(checker).canExecute(keyHash, target, data);
+        return false;
+    }
 
     /// @dev Returns whether the call is a self execute.
     function _isSelfExecute(address target, bytes4 fnSel) internal view returns (bool) {
@@ -598,7 +689,7 @@ abstract contract GuardedExecutor is ERC7821 {
         // Sanity check as a key hash of `bytes32(0)` represents the EOA's key itself.
         // The EOA is should be able to call any function on itself,
         // and able to spend as much as it needs. No point restricting, since the EOA
-        // key can always be used to change the delegation anyways.
+        // key can always be used to change the account anyways.
         if (keyHash == bytes32(0)) revert KeyHashIsZero();
         _;
     }
